@@ -1,0 +1,10 @@
+{
+  "name": "discord-todo-mcp",
+  "version": "1.0.0",
+  "bin": "index.js",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "discord.js": "^14.16.0"
+  }
+}
