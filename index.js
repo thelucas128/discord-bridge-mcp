@@ -17,7 +17,7 @@ client.on("ready", () => console.log("Discord client ready"));
 client.login(TOKEN).catch((e) => console.error("Discord login failed:", e.message));
 
 const server = new Server(
-  { name: "discord-todo-mcp", version: "1.0.0" },
+  { name: "discord-bridge-mcp", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 

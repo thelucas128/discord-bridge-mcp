@@ -1,5 +1,5 @@
 {
-  "name": "discord-todo-mcp",
+  "name": "discord-bridge-mcp",
   "version": "1.0.0",
   "bin": "index.js",
   "type": "module",

@@ -1,7 +1,10 @@
-# discord-todo-mcp
+# discord-bridge-mcp
 
 An [MCP](https://modelcontextprotocol.io) server that gives an AI agent a todo list and a
 direct line to your Discord DMs, so you can see what it's doing without watching the terminal.
+
+Renamed from `discord-todo-mcp`, which undersold it: the DM progress channel is the main feature,
+the todo list is secondary.
 
 Tools exposed over stdio:
 
@@ -67,10 +70,10 @@ which pops a separate console window on every start.
 ```json
 {
   "mcp": {
-    "discord-todo-mcp": {
+    "discord-bridge-mcp": {
       "type": "local",
-      "command": ["node", "/absolute/path/to/discord-todo-mcp/index.js"],
-      "cwd": "/absolute/path/to/discord-todo-mcp",
+      "command": ["node", "/absolute/path/to/discord-bridge-mcp/index.js"],
+      "cwd": "/absolute/path/to/discord-bridge-mcp",
       "enabled": true
     }
   }
