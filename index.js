@@ -55,6 +55,33 @@ const loggedIn = () => (ready ??= client.login(TOKEN).catch((e) => { throw new E
 
 const ok = (text) => ({ content: [{ type: "text", text }] });
 
+// Bulk delete the bot's own recent DMs. 99+ means "everything".
+// Deletes one by one on purpose: bulkDelete needs Manage Messages, which bots
+// don't get in DM channels.
+async function clearMessages(count) {
+  const user = await client.users.fetch(USER_ID).catch(() => null);
+  if (!user) throw new Error("User not found — check DISCORD_USER_ID");
+  const ch = await user.createDM();
+  const all = count >= 99;
+  let deleted = 0;
+  let before;
+  while (all || deleted < count) {
+    // eslint-disable-next-line no-await-in-loop -- sequential deletes, one batch at a time
+    const batch = await ch.messages.fetch({ limit: 100, before }).catch(() => null);
+    if (!batch || batch.size === 0) break;
+    for (const m of batch.values()) {
+      if (m.author.id !== client.user.id) continue; // only our own messages
+      // eslint-disable-next-line no-await-in-loop
+      const done = await m.delete().then(() => true).catch(() => false);
+      if (done) deleted++;
+      if (!all && deleted >= count) break;
+    }
+    before = batch.last().id;
+    if (!all) break; // one fetch covers any count under 99
+  }
+  return `Deleted ${deleted} message(s)${all ? " (all)" : ""}`;
+}
+
 async function dm(text, emojis = []) {
   if (!USER_ID) throw new Error("DISCORD_USER_ID not set — run setup");
   const user = await client.users.fetch(USER_ID).catch(() => null);
@@ -146,6 +173,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: `Send the todo list to the user as a DM.${voiceNote}`,
       inputSchema: { type: "object", properties: { emojis: { type: "array", items: { type: "string" } } } },
     },
+    {
+      name: "clear_messages",
+      description:
+        "Delete the bot's own recent Discord DMs. count = how many; 99 or more clears the entire DM history. Use when the user says '/clear-discordmessage', 'clear my discord messages', or 'wipe the discord log'.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          count: { type: "number", description: "How many recent bot messages to delete. 99+ = everything." },
+        },
+        required: ["count"],
+      },
+    },
   ],
 }));
 
@@ -176,6 +215,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (!TOKEN) return ok("Not configured yet — call setup first.");
       await loggedIn();
       return ok(await dm(args.message, args.emojis || []));
+    }
+    if (name === "clear_messages") {
+      if (!TOKEN) return ok("Not configured yet — call setup first.");
+      await loggedIn();
+      return ok(await clearMessages(args.count));
     }
     if (name === "todo_share") {
       if (!TOKEN) return ok("Not configured yet — call setup first.");

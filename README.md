@@ -68,6 +68,13 @@ Config resolution order: `DISCORD_TOKEN` / `DISCORD_USER_ID` env vars → `~/.di
 | `progress_report` | DM the user a progress update. Optional `emojis: ["🔥","✅"]` adds reactions. |
 | `todo_add` / `todo_list` / `todo_done` | The todo list. |
 | `todo_share` | DM the whole list as a checklist. |
+| `clear_messages` | Delete the bot's own recent DMs. `count: 99` or more = wipe the whole DM history. |
+
+### Clearing messages
+
+In OpenCode, `/clear-discordmessage 20` deletes the last 20 bot DMs; `/clear-discordmessage` with no number (or "all") wipes everything.
+
+Works only on the bot's **own** messages — anything you sent is untouched, and Discord requires the bot to be the author.
 
 ## Personality
 
