@@ -67,7 +67,8 @@ Config resolution order: `DISCORD_TOKEN` / `DISCORD_USER_ID` env vars → `~/.di
 | `setup_status` | Is it configured? Returns `setup_is_configured`. |
 | `progress_report` | DM the user a progress update. Optional `emojis: ["🔥","✅"]` adds reactions. |
 | `todo_add` / `todo_list` / `todo_done` | The todo list. |
-| `todo_share` | DM the whole list as a checklist. |
+| `todo_share` — **removed**. It wrapped your words in a template; use `todo_list` to read the list, then `send_message` with your own wording. |
+| `send_message` | DM the user. **Sent exactly as written** — no prefix, no template. |
 | `clear_messages` | Delete the bot's own recent DMs. `count: 99` or more = wipe the whole DM history. |
 
 ### Clearing messages

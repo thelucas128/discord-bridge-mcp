@@ -82,11 +82,14 @@ async function clearMessages(count) {
   return `Deleted ${deleted} message(s)${all ? " (all)" : ""}`;
 }
 
+// Sends `text` verbatim. No framing, no template, no prefix — the agent
+// decides every word. Only Discord's own 2000-char limit is applied.
 async function dm(text, emojis = []) {
   if (!USER_ID) throw new Error("DISCORD_USER_ID not set — run setup");
   const user = await client.users.fetch(USER_ID).catch(() => null);
   if (!user) throw new Error("User not found — check DISCORD_USER_ID");
-  const msg = await user.send(text.slice(0, 2000)); // Discord DM hard limit
+  const body = text.length > 2000 ? `${text.slice(0, 1997)}...` : text;
+  const msg = await user.send(body);
   for (const e of emojis) await msg.react(e).catch(() => {});
   return `DM sent${emojis.length ? ` +${emojis.length} reaction(s)` : ""}`;
 }
@@ -169,9 +172,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: { index: { type: "number" } }, required: ["index"] },
     },
     {
-      name: "todo_share",
-      description: `Send the todo list to the user as a DM.${voiceNote}`,
-      inputSchema: { type: "object", properties: { emojis: { type: "array", items: { type: "string" } } } },
+      name: "send_message",
+      description: `DM the user. The message is delivered EXACTLY as written — no prefix, no template, no added formatting. Compose the wording yourself.${voiceNote}`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          message: { type: "string", description: "The exact text to send, already fully written" },
+          emojis: { type: "array", items: { type: "string" }, description: "Optional emoji to react with" },
+        },
+        required: ["message"],
+      },
     },
     {
       name: "clear_messages",
@@ -211,7 +221,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         })
       );
     }
-    if (name === "progress_report") {
+    if (name === "send_message" || name === "progress_report") {
       if (!TOKEN) return ok("Not configured yet — call setup first.");
       await loggedIn();
       return ok(await dm(args.message, args.emojis || []));
@@ -220,14 +230,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (!TOKEN) return ok("Not configured yet — call setup first.");
       await loggedIn();
       return ok(await clearMessages(args.count));
-    }
-    if (name === "todo_share") {
-      if (!TOKEN) return ok("Not configured yet — call setup first.");
-      await loggedIn();
-      const list = todos.length
-        ? todos.map((t, i) => `${t.done ? "✅" : "⬜️"} ${i}. ${t.task}`).join("\n")
-        : "Nothing on the list yet.";
-      return ok(await dm(`📋 Here's where we are:\n${list}`, args.emojis || []));
     }
     if (name === "todo_add") {
       todos.push({ task: args.task, done: false });
