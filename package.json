@@ -1,8 +1,31 @@
 {
   "name": "discord-bridge-mcp",
-  "version": "1.0.0",
-  "bin": "index.js",
+  "version": "2.0.0",
+  "description": "MCP server that DMs an agent's todo list and friendly progress updates to Discord, with emoji reactions.",
+  "license": "MIT",
   "type": "module",
+  "bin": {
+    "discord-bridge-mcp": "index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "discord",
+    "discord-bot",
+    "todo",
+    "progress",
+    "model-context-protocol"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thelucas128/discord-bridge-mcp.git"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "discord.js": "^14.16.0"
