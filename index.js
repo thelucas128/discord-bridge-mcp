@@ -9,7 +9,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+
 import { createInterface } from "node:readline";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -48,19 +48,6 @@ const client = new Client({
   partials: [Partials.Message],
 });
 const todos = [];
-const pending = [];
-
-// Incoming DM replies resolve the oldest pending question (FIFO).
-client.on("messageCreate", (msg) => {
-  try {
-    if (!USER_ID || msg.author.id !== USER_ID) return;
-    if (msg.channel.type !== 1) return; // DM channel only
-    const q = pending.shift();
-    if (!q) return;
-    clearTimeout(q.timer);
-    q.resolve(msg.body.trim());
-  } catch {} // never let a Discord event crash the server
-});
 
 // Lazy login: setup CLI needs to log in itself, and the server must start
 // unconfigured so the setup tool can be called.
@@ -68,6 +55,7 @@ let ready = null;
 const loggedIn = () => (ready ??= client.login(TOKEN).catch((e) => { throw new Error(`login failed: ${e.message}`); }));
 
 const ok = (text) => ({ content: [{ type: "text", text }] });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Bulk delete the bot's own recent DMs. 99+ means "everything".
 // Deletes one by one on purpose: bulkDelete needs Manage Messages, which bots
@@ -279,19 +267,32 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const user = await client.users.fetch(USER_ID).catch(() => null);
       if (!user) return ok("User not found — check DISCORD_USER_ID");
       const ch = await user.createDM();
-      await ch.send(args.question).catch(() => {});
-      const id = randomUUID();
       const timeoutMs = Number(args.timeout_ms) || 60000;
-      const answer = await new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          const i = pending.findIndex((p) => p.id === id);
-          if (i >= 0) pending.splice(i, 1);
-          resolve(null);
-        }, timeoutMs);
-        pending.push({ id, resolve, timer });
-      });
-      const fallback = answer === null ? `no reply within ${timeoutMs / 1000}s — used default_answer: ${args.default_answer ?? "(none)"}` : answer;
-      return ok(`Answer: ${fallback}`);
+      const sent = await ch.send(args.question).catch(() => null);
+      // Poll instead of one long timer + MESSAGE_CREATE: a dropped gateway event
+      // can't strand the wait, and the wall-clock deadline can't be starved.
+      const deadline = Date.now() + timeoutMs;
+      let answer = null;
+      while (sent && !answer && Date.now() < deadline) {
+        await sleep(2000);
+        const msgs = await ch.messages.fetch({ limit: 20 }).catch(() => null);
+        answer =
+          [...(msgs?.values?.() ?? [])]
+            .filter(
+              (m) =>
+                m.author?.id === USER_ID &&
+                !m.webhookId &&
+                m.createdTimestamp > sent.createdTimestamp
+            )
+            .map((m) => m.content?.trim())
+            .find(Boolean) ?? null;
+      }
+      const body =
+        answer ??
+        `no reply within ${timeoutMs / 1000}s — used default_answer: ${
+          args.default_answer ?? "(none)"
+        }`;
+      return ok(`Answer: ${body}`);
     }
     if (name === "ping") {
       if (!TOKEN) return ok("Not configured yet — call setup first.");

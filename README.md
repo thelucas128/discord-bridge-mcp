@@ -91,7 +91,7 @@ Works only on the bot's **own** messages — anything you sent is untouched, and
 }
 ```
 
-Only one question at a time per user; replies are matched to the oldest pending question.
+The wait polls the DM channel against a wall-clock deadline rather than relying on a single long timer plus a `MESSAGE_CREATE` event, so a dropped gateway event can't strand the call. Concurrent `ask_question` calls in the same DM can cross-match a reply — ask one at a time.
 
 ## Ping
 
