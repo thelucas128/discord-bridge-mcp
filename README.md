@@ -70,12 +70,32 @@ Config resolution order: `DISCORD_TOKEN` / `DISCORD_USER_ID` env vars → `~/.di
 | `todo_share` — **removed**. It wrapped your words in a template; use `todo_list` to read the list, then `send_message` with your own wording. |
 | `send_message` | DM the user. **Sent exactly as written** — no prefix, no template. |
 | `clear_messages` | Delete the bot's own recent DMs. `count: 99` or more = wipe the whole DM history. |
+| `ask_question` | DM the user a question; waits up to `timeout_ms` (default 60000 = 1 minute) for a reply, otherwise returns `default_answer` so the agent falls back to its default (e.g., Opencode). |
+| `ping` | Mention the user (`<@id>`) on Discord, optionally with a short message. |
 
 ### Clearing messages
 
 In OpenCode, `/clear-discordmessage 20` deletes the last 20 bot DMs; `/clear-discordmessage` with no number (or "all") wipes everything.
 
 Works only on the bot's **own** messages — anything you sent is untouched, and Discord requires the bot to be the author.
+
+## Questions
+
+`ask_question` sends the question as a DM and waits for a reply. If the user answers within the timeout, their answer is returned. Otherwise it returns `default_answer` (or `[no reply]`) so the agent can fall back to its default behavior — e.g. Opencode — instead of blocking.
+
+```json
+{
+  "question": "Should I use Node 20 or 22?",
+  "default_answer": "Node 20",
+  "timeout_ms": 60000
+}
+```
+
+Only one question at a time per user; replies are matched to the oldest pending question.
+
+## Ping
+
+`ping` sends a mention (`<@USER_ID>`) with an optional message, useful for "restart required" or attention-getting DMs.
 
 ## Personality
 

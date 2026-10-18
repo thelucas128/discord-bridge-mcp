@@ -9,6 +9,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -42,11 +43,24 @@ const USER_ID = process.env.DISCORD_USER_ID || config.userId;
 const PERSONALITY = process.env.DISCORD_PERSONALITY || config.personality || DEFAULT_PERSONALITY;
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
   // Needed so react() can resolve a fetched DM message's reaction collector.
   partials: [Partials.Message],
 });
 const todos = [];
+const pending = [];
+
+// Incoming DM replies resolve the oldest pending question (FIFO).
+client.on("messageCreate", (msg) => {
+  try {
+    if (!USER_ID || msg.author.id !== USER_ID) return;
+    if (msg.channel.type !== 1) return; // DM channel only
+    const q = pending.shift();
+    if (!q) return;
+    clearTimeout(q.timer);
+    q.resolve(msg.body.trim());
+  } catch {} // never let a Discord event crash the server
+});
 
 // Lazy login: setup CLI needs to log in itself, and the server must start
 // unconfigured so the setup tool can be called.
@@ -195,6 +209,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["count"],
       },
     },
+    {
+      name: "ask_question",
+      description:
+        "Ask the user a question via Discord DM. Waits up to timeout_ms (default 60000 = 1 minute) for a reply; if none arrives, returns default_answer so the agent can fall back to its default MCP/app (e.g., Opencode) instead of blocking.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "The question to ask the user" },
+          default_answer: {
+            type: "string",
+            description: "Answer used when the user does not reply within timeout_ms — the agent's fallback (e.g., its default behavior)",
+          },
+          timeout_ms: { type: "number", description: "How long to wait for a reply in ms (default 60000)" },
+        },
+        required: ["question"],
+      },
+    },
+    {
+      name: "ping",
+      description: "Ping the user on Discord (mentions them), optionally with a short message.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          message: { type: "string", description: "Optional message to send along with the ping" },
+          emojis: { type: "array", items: { type: "string" }, description: "Optional emoji to react with" },
+        },
+      },
+    },
   ],
 }));
 
@@ -230,6 +272,32 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (!TOKEN) return ok("Not configured yet — call setup first.");
       await loggedIn();
       return ok(await clearMessages(args.count));
+    }
+    if (name === "ask_question") {
+      if (!TOKEN) return ok("Not configured yet — call setup first.");
+      await loggedIn();
+      const user = await client.users.fetch(USER_ID).catch(() => null);
+      if (!user) return ok("User not found — check DISCORD_USER_ID");
+      const ch = await user.createDM();
+      await ch.send(args.question).catch(() => {});
+      const id = randomUUID();
+      const timeoutMs = Number(args.timeout_ms) || 60000;
+      const answer = await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          const i = pending.findIndex((p) => p.id === id);
+          if (i >= 0) pending.splice(i, 1);
+          resolve(null);
+        }, timeoutMs);
+        pending.push({ id, resolve, timer });
+      });
+      const fallback = answer === null ? `no reply within ${timeoutMs / 1000}s — used default_answer: ${args.default_answer ?? "(none)"}` : answer;
+      return ok(`Answer: ${fallback}`);
+    }
+    if (name === "ping") {
+      if (!TOKEN) return ok("Not configured yet — call setup first.");
+      await loggedIn();
+      const body = args.message ? `${args.message}\n<@${USER_ID}>` : `<@${USER_ID}>`;
+      return ok(await dm(body, args.emojis || []));
     }
     if (name === "todo_add") {
       todos.push({ task: args.task, done: false });
