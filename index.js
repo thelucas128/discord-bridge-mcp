@@ -297,7 +297,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "ping") {
       if (!TOKEN) return ok("Not configured yet — call setup first.");
       await loggedIn();
-      const body = args.message ? `${args.message}\n<@${USER_ID}>` : `<@${USER_ID}>`;
+      const body = args.message ? `<@${USER_ID}> ${args.message}` : `<@${USER_ID}>`;
       return ok(await dm(body, args.emojis || []));
     }
     if (name === "todo_add") {
