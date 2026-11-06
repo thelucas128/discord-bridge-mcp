@@ -1,7 +1,7 @@
 {
   "name": "discord-bridge-mcp",
-  "version": "2.0.0",
-  "description": "MCP server that DMs an agent's todo list and friendly progress updates to Discord, with emoji reactions.",
+  "version": "3.0.0",
+  "description": "MCP server that DMs an agent's todo list, progress, screenshots and questions to Discord, with emoji reactions and live replies.",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -20,6 +20,8 @@
     "discord-bot",
     "todo",
     "progress",
+    "screenshots",
+    "agent",
     "model-context-protocol"
   ],
   "repository": {

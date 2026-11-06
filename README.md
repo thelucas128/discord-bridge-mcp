@@ -1,10 +1,24 @@
 # discord-bridge-mcp
 
-An MCP server that DMs **your agent's** todo list and progress updates to Discord — with emoji reactions and a personality you pick.
+An MCP server that turns your Discord DMs into a live line between you and your agent: it DMs progress updates, the todo list, screenshots, questions, and it reads your replies, in real time.
 
-The agent writes the messages itself, in whatever voice you configure. You get pings on your phone instead of staring at a terminal.
+The agent writes the messages itself, in whatever voice you configure. You get everything on your phone instead of staring at a terminal.
 
-## Install — pick one
+## What you need (all three)
+
+1. **A bot token**: create an app at https://discord.com/developers/applications, open it, go to **Bot**, and click **Reset Token**. Copy it immediately: Discord only shows it once.
+2. **Your Discord user ID**: enable **User Settings, Advanced, Developer Mode** in Discord, then right-click yourself in any chat and choose **Copy User ID**. It is a long number like `822139237184962561`.
+3. **An OAuth invite**: the bot can only DM you if you **share a server with it** (or your privacy settings already allow server members to DM you). Invite your app with this URL, replacing `CLIENT_ID`:
+
+```
+https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot&permissions=117824
+```
+
+`117824` covers exactly what the bridge needs: View Channels, Add Reactions, Send Messages, Embed Links, Attach Files, Read Message History.
+
+Both tools in the server (`setup_status`, `setup`) return this exact invite link once the token is known, so the agent handles the URL for you.
+
+## Install, pick one
 
 ### Option A: straight from GitHub (no npm publish needed)
 
@@ -18,9 +32,7 @@ The agent writes the messages itself, in whatever voice you configure. You get p
 }
 ```
 
-That's it. First run downloads deps; later runs are cached.
-
-> **Windows:** `npx` spawns `npx.cmd`, which pops a black console window on every launch. If that bothers you, clone once and run `node` on the file instead — see Option B.
+> **Windows:** `npx` spawns `npx.cmd`, which pops a black console window on every launch. If that bothers you, clone once and run `node` on the file instead: Option B.
 
 ### Option B: clone it (no console window)
 
@@ -40,12 +52,9 @@ npm install
 }
 ```
 
-### Configure it — let the agent do the work
+### Configure it: let the agent do the work
 
-Restart your MCP client and just ask the agent: **"set up discord"**. It will call `setup_status`, ask you for two things, then call `setup`:
-
-1. **Your bot token** — from https://discord.com/developers/applications → your app → **Bot** → **Reset Token**. Copy it immediately, Discord shows it once.
-2. **Your Discord user ID** — enable **User Settings → Advanced → Developer Mode**, then right-click yourself → **Copy User ID**. It's a long number like `822139237184962561`.
+Restart your MCP client and just ask the agent: **"set up discord"**. It calls `setup_status`, asks you for the bot token and your user ID, then calls `setup`. Setup applies live (no restart), sends you a confirmation DM, and includes the invite link if the first DM cannot get through.
 
 Prefer a terminal? Same thing:
 
@@ -53,49 +62,56 @@ Prefer a terminal? Same thing:
 npx -y github:thelucas128/discord-bridge-mcp setup
 ```
 
-It prompts for token, user ID, and personality, saves to `~/.discord-bridge-mcp.json`, signs in, and DMs you a confirmation. **Restart the MCP server afterwards** — the running process caches its config at startup.
+It prompts for token, user ID, and personality, saves to `~/.discord-bridge-mcp.json`, signs in, and DMs you a confirmation.
 
-Config resolution order: `DISCORD_TOKEN` / `DISCORD_USER_ID` env vars → `~/.discord-bridge-mcp.json`. Override the file path with `DISCORD_BRIDGE_CONFIG`.
-
-> Why a config file and not just env vars? Most MCP clients spawn servers with a *filtered* environment, so `setx` variables often never reach the process. The file always works.
+**Config order, first hit wins:** env `DISCORD_TOKEN` / `DISCORD_USER_ID`, then a `.env` file next to `index.js` or in the cwd (`TOKEN=` also works for the token), then `~/.discord-bridge-mcp.json`. Override the file location with `DISCORD_BRIDGE_CONFIG`.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `setup` | Save token + user ID + personality to disk. Agent calls this for you. |
-| `setup_status` | Is it configured? Returns `setup_is_configured`. |
+| `setup` | Save token + user ID + personality, then sign in live. No restart needed. |
+| `setup_status` | Is it configured? Returns `setup_is_configured`, the OAuth invite URL, and next steps when it is not. |
 | `progress_report` | DM the user a progress update. Optional `emojis: ["🔥","✅"]` adds reactions. |
-| `todo_add` / `todo_list` / `todo_done` | The todo list. |
-| `todo_share` — **removed**. It wrapped your words in a template; use `todo_list` to read the list, then `send_message` with your own wording. |
-| `send_message` | DM the user. **Sent exactly as written** — no prefix, no template. |
-| `clear_messages` | Delete the bot's own recent DMs. `count: 99` or more = wipe the whole DM history. |
-| `ask_question` | DM the user a question; waits up to `timeout_ms` (default 60000 = 1 minute) for a reply, otherwise returns `default_answer` so the agent falls back to its default (e.g., Opencode). |
-| `ping` | Mention the user (`<@id>`) on Discord, optionally with a short message. |
+| `send_message` | DM the user. Sent exactly as written, no prefix, no template. |
+| `send_screenshot` | Send a file or screenshot from disk (`path`) or raw base64 bytes (`data`), with an optional caption. |
+| `ask_question` | DM a question and wait for the user's reply, detected in real time. On timeout, returns its `default_answer` so the agent keeps moving. |
+| `check_replies` | Non-blocking peek at the user's recent DM replies, with timestamps, to catch messages that arrived while the agent was working. |
+| `ping` | Mention the user (`<@id>`), phone notification. Optional short message. |
+| `todo_add` / `todo_list` / `todo_done` / `todo_remove` / `todo_reset` | The todo list. It persists across restarts. |
+| `clear_messages` | Delete the bot's own recent DMs. `count: 99` or more wipes the whole DM history. |
 
-### Clearing messages
+## Screenshots
 
-In OpenCode, `/clear-discordmessage 20` deletes the last 20 bot DMs; `/clear-discordmessage` with no number (or "all") wipes everything.
+The agent can show you what it did. The screenshot itself is taken by whatever tool the agent has (a browser tool, a capture command, anything that writes a file or prints base64), and the bridge sends it to your DM:
 
-Works only on the bot's **own** messages — anything you sent is untouched, and Discord requires the bot to be the author.
+```json
+{ "path": "C:/Users/you/AppData/Temp/shot-42.png", "message": "New dashboard is live" }
+```
 
-## Questions
+or from memory, no temp file needed:
 
-`ask_question` sends the question as a DM and waits for a reply. If the user answers within the timeout, their answer is returned. Otherwise it returns `default_answer` (or `[no reply]`) so the agent can fall back to its default behavior — e.g. Opencode — instead of blocking.
+```json
+{ "data": "iVBORw0KGgo...", "filename": "preview.png", "message": "error screen before the fix" }
+```
+
+Any file up to 25 MB works, png, jpg, gif, webp, pdf, whatever. One call, one roundtrip.
+
+## Talking while working
+
+`ask_question` sends the question and waits. Replies are detected by the Discord gateway, so the agent sees your answer the moment you hit send, with a light polling fallback in case an event gets dropped. If you say nothing within `timeout_ms` (default 60 s, max 10 min), it returns the agent's own `default_answer` and the agent continues with its default behavior instead of blocking you.
 
 ```json
 {
-  "question": "Should I use Node 20 or 22?",
-  "default_answer": "Node 20",
-  "timeout_ms": 60000
+  "question": "Migrate or keep the old schema?",
+  "default_answer": "keep it",
+  "timeout_ms": 90000
 }
 ```
 
-The wait polls the DM channel against a wall-clock deadline rather than relying on a single long timer plus a `MESSAGE_CREATE` event, so a dropped gateway event can't strand the call. Concurrent `ask_question` calls in the same DM can cross-match a reply — ask one at a time.
+`check_replies` is the free version: it returns your recent DMs with timestamps and never waits, so the agent can glance at your messages between steps ("read your replies, was that a yes?").
 
-## Ping
-
-`ping` sends a mention (`<@USER_ID>`) with an optional message, useful for "restart required" or attention-getting DMs.
+One `ask_question` at a time in the same thread: two waiting calls can cross-match your replies.
 
 ## Personality
 
@@ -105,38 +121,48 @@ Set once at setup, or change any time:
 { "personality": "dry and sarcastic, short sentences, British" }
 ```
 
-The server folds that sentence into the tool description, so the agent writes every DM in that voice. Default: *warm, encouraging, brief — like a friend cheering you on*.
+The server folds that sentence into the tool description, so the agent writes every DM in that voice. Default: *warm, encouraging, brief, like a friend cheering you on*. Changes apply on the next tool refresh, no restart.
 
 One personality per install. Run a second MCP instance on a different config file if you want two voices.
 
-## Emoji
+## Speed
 
-Two places, both supported:
+- The bot's user and DM channel are cached after the first fetch: each send is one Discord API call, not three.
+- Login is lazy and happens once per process, before the first message.
+- Questions arrive while you are still typing: gateway events wake the waiting tool instantly.
+- The `.env` parsing runs once at startup, no framework, still one file.
 
-- **In the text** — `progress_report({ message: "tests green 🎉" })`
-- **As reactions** — `progress_report({ message: "shipped", emojis: ["🚀", "✅"] })`
+## Persistence
 
-Reactions use real Discord reactions, so they render as the emoji hovering under the message.
+Todos are saved in the config file on every change (`todo_add`, `todo_done`, `todo_remove`, `todo_reset` all write through), so `todo_list` survives a server restart. Messages stay in the DM history you already scroll.
+
+## Clearing messages
+
+In OpenCode, `/clear-discordmessage 20` deletes the last 20 bot DMs; `/clear-discordmessage` with no number (or "all") wipes everything.
+
+Works only on the bot's **own** messages: anything you sent is untouched, and Discord requires the bot to be the author.
 
 ## Requirements
 
 - Node 20+
-- A Discord bot token (create one at https://discord.com/developers/applications)
+- A Discord bot token (see above)
 - To DM you, the bot must be in a server **with you**, **or** you must have DMs from server members enabled
 
 ## Troubleshooting
 
-**"Cannot send messages to this user" (error 50007)** — the bot can't DM you. Invite it to a server you share, then retry. Server → *Invite People* → paste the bot's URL with the `client_id` from the Developer Portal.
+**"Cannot send messages to this user" (error 50007)**: the bot cannot DM you. It needs to share a server with you. Ask the agent to call `setup_status` and open the `invite_url` it returns (the `setup` CLI prints it too), invite the bot, then retry. You can also build the URL by hand from the top of this README, using your app's client id.
 
-**Nothing arrives** — call `setup_status`; check `setup_is_configured` is true and that the running process was restarted after setup.
+**Nothing arrives**: call `setup_status`; check `setup_is_configured` is true. The v3 bridge hot-reloads after `setup`, no restart needed. But if the running process is still an older version, restart the MCP server once.
 
-**Todos vanish on restart** — they're in memory only. Persistence is not built in.
+**Upload rejected: too big**: Discord caps bot uploads at 25 MB per file. Compress the screenshot or crop it.
+
+**No reply detected in `ask_question`**: gateway connections can drop without notice once in a while. The bridge already polls every 5 s as backup, so a rare miss recovers on the next sweep. If every question times out, check the bot is still invited on a server you share, and that you replied inside the bot's DM, not another channel.
 
 ## Security
 
 - Your token is a full bot credential. Never paste it into a committed file, an issue, or a screenshot.
 - `~/.discord-bridge-mcp.json` holds it in plaintext. On a shared machine, use env vars instead or delete the file after setup.
-- Leaked? Reset it in the Developer Portal immediately — the old one dies.
+- Leaked? Reset it in the Developer Portal immediately, the old one dies.
 - `.gitignore` excludes `.env*`; `.env.example` is placeholders only.
 
 ## License
