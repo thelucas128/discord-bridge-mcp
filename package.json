@@ -1,6 +1,6 @@
 {
   "name": "discord-bridge-mcp",
-  "version": "3.0.0",
+  "version": "3.3.0",
   "description": "MCP server that DMs an agent's todo list, progress, screenshots and questions to Discord, with emoji reactions and live replies.",
   "license": "MIT",
   "type": "module",

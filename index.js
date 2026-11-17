@@ -9,7 +9,7 @@
 // Override the config location with DISCORD_BRIDGE_CONFIG.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, openSync, readSync, closeSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
@@ -19,11 +19,17 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { AttachmentBuilder, Client, GatewayIntentBits, Partials } from "discord.js";
+import { AttachmentBuilder, Client, EmbedBuilder, GatewayIntentBits, Partials } from "discord.js";
+import { ActivityType } from "discord-api-types/v10";
 
-const VERSION = "3.0.0";
+const VERSION = "3.3.0";
 const DEFAULT_PERSONALITY = "warm, encouraging, brief, like a friend cheering you on";
 const MAX_UPLOAD = 25 * 1024 * 1024; // Discord's bot attachment cap: 25 MB
+const MAX_DOWNLOAD = 50 * 1024 * 1024; // guard against filling the disk with user files
+const TEXT_EXT = /\.(txt|md|json|csv|log|xml|html?|js|ts|py|ya?ml|ini|env|sql|sh)$/i;
+const MAX_PROFILE_IMAGE = 10 * 1024 * 1024; // avatars, banners, app icons and covers
+const PROFILE_IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp"];
+const PRESENCE_STATUSES = ["online", "idle", "dnd", "invisible"];
 
 // Some users keep the token in a .env next to the server. Fill keys that the
 // real environment does not already set, so the client always wins.
@@ -106,6 +112,70 @@ function oauthInvite(token = TOKEN) {
 }
 
 const ok = (text) => ({ content: [{ type: "text", text }] });
+
+// Hex strings, #rgb shorthand and a few named colors, all resolved to the
+// integer Discord wants. Unknown names fail loudly instead of silently
+// dropping the color the agent chose.
+function parseColor(value) {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "number") return value;
+  const s = String(value).trim();
+  if (/^#?[0-9a-fA-F]{6}$/.test(s)) return parseInt(s.replace("#", ""), 16);
+  if (/^#?[0-9a-fA-F]{3}$/.test(s)) {
+    const h = s.replace("#", "");
+    return parseInt(h.split("").map((c) => c + c).join(""), 16);
+  }
+  const named = {
+    red: 0xed4245, green: 0x57f287, blue: 0x3498db, blurple: 0x5865f2,
+    yellow: 0xfee75c, orange: 0xfaa61c, purple: 0x9b59b6, gold: 0xf1c40f,
+    grey: 0x99aab5, gray: 0x99aab5, white: 0xffffff, black: 0x000000,
+  };
+  const found = named[s.toLowerCase()];
+  if (found === undefined) throw new Error(`Unknown embed color "${value}". Use #RRGGBB or red/green/blue/yellow/orange/purple/gold/grey/white/black.`);
+  return found;
+}
+
+// One builder for both send_embed and set_status. Discord silently rejects
+// oversized embeds, so cap the individual parts and check the 6000-char total.
+function makeEmbed(args) {
+  const keys = ["title", "description", "fields", "color", "url", "footer"];
+  if (!keys.some((k) => args[k] !== undefined && args[k] !== null && args[k] !== "")) return null;
+  const embed = new EmbedBuilder();
+  if (args.title) embed.setTitle(String(args.title).slice(0, 256));
+  if (args.description) embed.setDescription(String(args.description).slice(0, 4096));
+  if (args.url) embed.setURL(String(args.url));
+  const color = parseColor(args.color);
+  if (color !== undefined) embed.setColor(color);
+  if (args.footer) embed.setFooter({ text: String(args.footer).slice(0, 2048) });
+  if (Array.isArray(args.fields) && args.fields.length) {
+    embed.addFields(args.fields.slice(0, 25).map((f) => ({
+      name: String(f?.name ?? "—").slice(0, 256) || "—",
+      value: String(f?.value ?? "—").slice(0, 1024) || "—",
+      inline: Boolean(f?.inline),
+    })));
+  }
+  const d = embed.data;
+  const total =
+    String(d.title ?? "").length + String(d.description ?? "").length +
+    String(d.footer?.text ?? "").length +
+    (d.fields ?? []).reduce((n, f) => n + f.name.length + f.value.length, 0);
+  if (total > 6000) {
+    throw new Error(`Embed is ${total} chars; Discord allows 6000. Trim the title, fields or description.`);
+  }
+  if (!d.title && !d.description && !d.footer?.text && !d.fields?.length && !d.url) {
+    throw new Error("Embed has nothing to show. Add a title, description, fields, url or footer.");
+  }
+  return embed;
+}
+
+function safeFileName(name) {
+  return String(name || "attachment.bin").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "attachment.bin";
+}
+
+function saveStatusId(id) {
+  config = { ...config, statusMessageId: id };
+  saveConfig(config);
+}
 
 // One user fetch + DM channel fetch per user, cached: every later send
 // becomes a single API roundtrip instead of three.
@@ -198,6 +268,40 @@ function imageDataCheck(buf, name) {
   return looks(buf) ? null : `bytes are not valid ${ext}; likely a data URL or wrong data was passed, decode to raw base64 first`;
 }
 
+// Profile art must be real image bytes: a data URL, a renamed .txt or a wrong
+// path fails here with one clear message instead of a confusing 400 from Discord.
+function profileImage(src, label) {
+  // A bare string is a path, unless it is a data URL (then it is the bytes).
+  if (typeof src === "string") src = src.startsWith("data:") ? { data: src } : { path: src };
+  if (!src || (!src.path && !src.data)) {
+    throw new Error(`${label}: pass { path } or { data, filename }.`);
+  }
+  let buf, name;
+  if (src.path) {
+    let p = String(src.path);
+    if (p.startsWith("~")) p = join(homedir(), p.slice(1));
+    p = resolve(p);
+    if (!existsSync(p)) throw new Error(`${label}: file not found: ${p}`);
+    buf = readFileSync(p);
+    name = basename(p);
+  } else {
+    const b64 = String(src.data).trim().replace(/^data:[^,]*base64,/, "").replace(/\s/g, "");
+    buf = Buffer.from(b64, "base64");
+    name = src.filename || `${label}.png`;
+  }
+  if (!buf.length) throw new Error(`${label}: "${name}" is empty or not valid base64.`);
+  if (buf.length > MAX_PROFILE_IMAGE) {
+    throw new Error(`${label}: ${(buf.length / 1048576).toFixed(1)} MB is over the ${MAX_PROFILE_IMAGE / 1048576} MB cap.`);
+  }
+  const ext = String(name).toLowerCase().split(".").pop();
+  if (!PROFILE_IMAGE_EXT.includes(ext)) {
+    throw new Error(`${label}: "${name}" is not an image; use png, jpg, jpeg, gif or webp.`);
+  }
+  const problem = imageDataCheck(buf, name);
+  if (problem) throw new Error(`${label}: ${problem}`);
+  return { buf, name };
+}
+
 // path sends a file off disk; data sends base64 bytes under a filename.
 // Discord infers the type from the extension, so the name matters.
 async function sendAttachment({ path, data, filename, message }) {
@@ -243,18 +347,20 @@ async function sendAttachment({ path, data, filename, message }) {
     );
   }
   const ch = await getChannel();
+  let sent;
   try {
-    await ch.send({ content: message || undefined, files: [file] });
+    sent = await ch.send({ content: message || undefined, files: [file] });
   } catch (e) {
     throw new Error(`${e.message}${dmHint(e)}`);
   }
-  return `Screenshot sent: ${name} (${(bytes / 1024).toFixed(1)} KB)`;
+  return `Screenshot sent: ${name} (${(bytes / 1024).toFixed(1)} KB, msg ${sent.id})`;
 }
 
 // The gateway pushes new DMs instantly; a light poll backs it up if an
 // event gets dropped. First matching reply wins, whichever path sees it.
 function waitForReply(channel, cutoffTs, timeoutMs) {
   const describe = (m) => ({
+    id: m.id,
     content: String(m.content ?? "").trim(),
     from: m.author?.username ?? USER_ID,
     attachments: [...(m.attachments?.values() ?? [])].map((a) => a.name),
@@ -323,7 +429,7 @@ async function recentReplies({ limit = 5, all = false, since_minutes = null } = 
       const files = [...(m.attachments?.values() ?? [])].map((a) => a.name);
       return `${at} UTC: ${String(m.content ?? "").trim() || "(no text)"}${
         files.length ? ` [attachment: ${files.join(", ")}]` : ""
-      }`;
+      } [msg:${m.id}]`;
     })
     .join("\n");
   return `${theirs.length} reply(ies) ${scope}:\n${body}`;
@@ -354,6 +460,280 @@ async function clearMessages(count) {
   return `Deleted ${deleted} message(s)${all ? " (all)" : ""}`;
 }
 
+async function sendEmbed(args) {
+  const embed = makeEmbed(args);
+  if (!embed) throw new Error("Nothing to send. Pass title, description, fields or color.");
+  const ch = await getChannel();
+  try {
+    await ch.send({ content: args.message || undefined, embeds: [embed] });
+  } catch (e) {
+    throw new Error(`${e.message}${dmHint(e)}`);
+  }
+  return `Embed sent (${embed.data.fields?.length ?? 0} field(s)).`;
+}
+
+// Discord renders .md attachments as a formatted document (headings, tables,
+// lists, code blocks) instead of a plain-text preview, so long structured
+// content that would blow past the 2000-char message cap goes out as a file.
+async function sendMarkdown({ markdown, path, filename, message } = {}) {
+  if (markdown === undefined && !path) {
+    throw new Error('Nothing to send. Pass "markdown" (the text) or "path" (an existing .md file).');
+  }
+  let body, name;
+  if (markdown !== undefined) {
+    body = Buffer.from(String(markdown), "utf8");
+    name = filename || "update.md";
+  } else {
+    let p = String(path);
+    if (p.startsWith("~")) p = join(homedir(), p.slice(1));
+    p = resolve(p);
+    if (!existsSync(p)) throw new Error(`File not found: ${p}`);
+    body = readFileSync(p);
+    name = filename || basename(p);
+  }
+  if (!body.length) throw new Error("Markdown is empty.");
+  if (body.length > MAX_UPLOAD) {
+    throw new Error(`Markdown is ${(body.length / 1048576).toFixed(1)} MB; Discord accepts up to 25 MB.`);
+  }
+  name = safeFileName(name);
+  if (!/\.(md|markdown)$/i.test(name)) name += ".md";
+  const dir = join(tmpdir(), "discord-bridge-mcp");
+  mkdirSync(dir, { recursive: true });
+  const out = join(dir, `${Date.now()}-${name}`);
+  writeFileSync(out, body);
+  const ch = await getChannel();
+  let sent;
+  try {
+    sent = await ch.send({ content: message || undefined, files: [new AttachmentBuilder(out, { name })] });
+  } catch (e) {
+    throw new Error(`${e.message}${dmHint(e)}`);
+  }
+  return `Markdown sent: ${name} (${(body.length / 1024).toFixed(1)} KB, msg ${sent.id}). Discord renders .md attachments as a formatted document.`;
+}
+
+// A single status message that gets edited in place, so a long task does not
+// flood the DM. Its id lives in the config file, so it survives a restart;
+// a stale id (message deleted or wiped by clear_messages) just creates a new one.
+async function upsertStatus(args) {
+  const ch = await getChannel();
+  const text = String(args.message ?? args.description ?? "");
+  const embed = makeEmbed({ ...args, description: text });
+  if (!embed && !text) throw new Error("Pass message text, or embed fields such as title/fields/color.");
+  if (!embed && text.length > 1999) {
+    throw new Error("Status text is over 1999 chars. Add a title or fields to send it as an embed, or use send_message.");
+  }
+  const payload = embed ? { embeds: [embed] } : { content: text };
+
+  let existing = null;
+  if (config.statusMessageId) {
+    existing = await ch.messages.fetch(config.statusMessageId).catch(() => null);
+    if (existing && existing.author?.id !== client.user?.id) existing = null;
+  }
+  if (existing) {
+    try {
+      await existing.edit(payload);
+      return `Updated live status message (${existing.id}).`;
+    } catch (e) {
+      if (!/Unknown Message|404|Missing Access|Cannot edit/i.test(e.message)) {
+        throw new Error(`${e.message}${dmHint(e)}`);
+      }
+      config.statusMessageId = null; // stale: fall through and create a fresh one
+    }
+  }
+  let sent;
+  try {
+    sent = await ch.send(payload);
+  } catch (e) {
+    throw new Error(`${e.message}${dmHint(e)}`);
+  }
+  saveStatusId(sent.id);
+  for (const e of args.emojis || []) await sent.react(e).catch(() => {});
+  return `Created live status message (${sent.id}). Call set_status again to update it in place.`;
+}
+
+async function clearStatus() {
+  const id = config.statusMessageId;
+  if (!id) return "No live status message to clear.";
+  config.statusMessageId = null;
+  saveConfig(config);
+  const ch = await getChannel().catch(() => null);
+  if (!ch) return `Forgot status id ${id}.`;
+  const msg = await ch.messages.fetch(id).catch(() => null);
+  if (msg) await msg.delete().catch(() => {});
+  return `Cleared live status message (${id}).`;
+}
+
+// Pull a file the user sent back out of the DM and onto disk, so the agent
+// can open it (vision on a screenshot, text preview on a log, etc.).
+async function readAttachments({ message_id, index = 0, attachment = 0, all = false, save_dir } = {}) {
+  const ch = await getChannel();
+  let msg;
+  if (message_id) {
+    msg = await ch.messages.fetch(String(message_id)).catch(() => null);
+    if (!msg) throw new Error(`Message ${message_id} not found in this DM. Use the msg id printed by check_replies or ask_question.`);
+  } else {
+    const msgs = await ch.messages
+      .fetch({ limit: 40 })
+      .catch((e) => Promise.reject(new Error(`Cannot read DM history (${e.message})`)));
+    const theirs = [...msgs.values()]
+      .filter((m) => m.author?.id === USER_ID && !m.webhookId)
+      .sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+    msg = theirs[Math.max(Number(index) || 0, 0)];
+    if (!msg) throw new Error("No recent message from the user. Ask them to send a file, or pass message_id.");
+  }
+  const list = [...(msg.attachments?.values() ?? [])];
+  if (!list.length) throw new Error(`Message ${msg.id} has no attachments.`);
+  const picks = all ? list : [list[Math.max(Number(attachment) || 0, 0)]].filter(Boolean);
+  if (!picks.length) throw new Error(`No attachment at index ${attachment}; this message has ${list.length}.`);
+
+  const dir = save_dir ? resolve(String(save_dir).replace(/^~/, homedir())) : join(tmpdir(), "discord-bridge-mcp");
+  mkdirSync(dir, { recursive: true });
+  const out = [];
+  for (const a of picks) {
+    if (a.size > MAX_DOWNLOAD) {
+      out.push(`${a.name}: ${(a.size / 1048576).toFixed(1)} MB exceeds the ${MAX_DOWNLOAD / 1048576} MB cap, skipped.`);
+      continue;
+    }
+    // eslint-disable-next-line no-await-in-loop -- one download at a time, bounded by attachment count
+    // discord.js v14 has no Attachment.download(), so fetch the CDN url directly.
+    let buf;
+    try {
+      const res = await fetch(a.url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      buf = Buffer.from(await res.arrayBuffer());
+    } catch (e) {
+      throw new Error(`Download failed for ${a.name} (${e.message})`);
+    }
+    const path = join(dir, `${msg.id}-${safeFileName(a.name)}`);
+    writeFileSync(path, buf);
+    const isText = /^text\//i.test(a.contentType || "") || TEXT_EXT.test(a.name || "");
+    const preview = isText ? `\nText:\n${buf.toString("utf8").slice(0, 4000)}` : "";
+    out.push(`Saved: ${path}\n  name: ${a.name} | size: ${(buf.length / 1024).toFixed(1)} KB | type: ${a.contentType || "unknown"} | message ${msg.id}${preview}`);
+  }
+  return out.join("\n\n");
+}
+
+// Give the bot its own identity: the username shown in DMs, the About Me bio
+// (the application description Discord shows on a bot profile), and the art:
+// avatar, banner, plus the app icon and cover image in the developer profile.
+// Username changes are capped at 2 per hour by Discord.
+async function updateProfile(args = {}) {
+  const images = ["avatar", "banner", "icon", "cover"].filter(
+    (k) => args[k] !== undefined && args[k] !== null && args[k] !== ""
+  );
+  if (args.name === undefined && args.bio === undefined && !images.length) {
+    throw new Error("Nothing to change. Pass name, bio, avatar, banner, icon or cover.");
+  }
+  await loggedIn();
+  const done = [];
+  if (args.name !== undefined) {
+    const username = String(args.name).trim();
+    if (!/^[a-zA-Z0-9._]{2,32}$/.test(username)) {
+      throw new Error("Username must be 2-32 characters: letters, numbers, underscore or period.");
+    }
+    try {
+      await client.user.setUsername(username);
+    } catch (e) {
+      throw new Error(`Username change failed (${e.message}). Discord allows 2 per hour.`);
+    }
+    done.push(`username → ${username}`);
+  }
+  if (args.bio !== undefined) {
+    const bio = String(args.bio).slice(0, 400);
+    try {
+      await client.application.edit({ description: bio });
+    } catch (e) {
+      throw new Error(`Bio change failed (${e.message}).`);
+    }
+    done.push(`bio → "${bio.length > 60 ? bio.slice(0, 60) + "…" : bio}" (${bio.length} chars)`);
+  }
+  for (const key of ["avatar", "banner"]) {
+    if (args[key] === undefined || args[key] === null || args[key] === "") continue;
+    const { buf, name } = profileImage(args[key], key);
+    try {
+      // eslint-disable-next-line no-await-in-loop -- at most two image calls, each rate-limited
+      await (key === "avatar" ? client.user.setAvatar(buf) : client.user.setBanner(buf));
+    } catch (e) {
+      throw new Error(`${key} change failed (${e.message}).`);
+    }
+    done.push(`${key} → ${name}`);
+  }
+  if (args.icon !== undefined || args.cover !== undefined) {
+    const patch = {};
+    if (args.icon !== undefined && args.icon !== null && args.icon !== "") {
+      patch.icon = profileImage(args.icon, "icon").buf;
+      done.push("app icon updated");
+    }
+    if (args.cover !== undefined && args.cover !== null && args.cover !== "") {
+      patch.coverImage = profileImage(args.cover, "cover").buf;
+      done.push("cover image updated");
+    }
+    try {
+      await client.application.edit(patch);
+    } catch (e) {
+      throw new Error(`App image change failed (${e.message}).`);
+    }
+  }
+  return `Profile updated: ${done.join("; ")}.`;
+}
+
+// The little status line under the bot's name: online/idle/dnd/invisible, and
+// the activity text ("Playing …", "Watching …", a custom status, …). Passing an
+// empty activity clears it; omitting a field keeps it as it is.
+async function setPresence(args = {}) {
+  const payload = {};
+  if (args.status !== undefined && args.status !== null && args.status !== "") {
+    const status = String(args.status).toLowerCase();
+    if (!PRESENCE_STATUSES.includes(status)) {
+      throw new Error(`status must be one of ${PRESENCE_STATUSES.join(", ")}.`);
+    }
+    payload.status = status;
+  }
+  if (args.activity !== undefined) {
+    const text = String(args.activity);
+    if (!text.trim()) {
+      payload.activities = [];
+    } else {
+      const kind = String(args.activity_type || "playing").toLowerCase();
+      const types = {
+        playing: ActivityType.Playing,
+        streaming: ActivityType.Streaming,
+        listening: ActivityType.Listening,
+        watching: ActivityType.Watching,
+        competing: ActivityType.Competing,
+        custom: ActivityType.Custom,
+      };
+      if (!(kind in types)) {
+        throw new Error(`activity_type must be one of ${Object.keys(types).join(", ")}.`);
+      }
+      const activity = { name: text.slice(0, 128), type: types[kind] };
+      if (kind === "streaming") {
+        // Discord only renders the purple "Live" style when a Twitch/YouTube
+        // url is attached; without one the same payload shows as Playing.
+        if (!args.activity_url) {
+          throw new Error("streaming needs activity_url (a twitch.tv or youtube.com link); without it Discord shows the activity as Playing.");
+        }
+        activity.url = String(args.activity_url);
+      }
+      payload.activities = [activity];
+    }
+  }
+  if (!("status" in payload) && !("activities" in payload)) {
+    throw new Error("Pass status, activity, or both.");
+  }
+  // Read the label before setPresence: for a custom activity discord.js rewrites
+  // name to "Custom Status" in place, so the object no longer holds what we set.
+  const activityLabel = "activities" in payload && payload.activities.length ? payload.activities[0].name : null;
+  await loggedIn();
+  await client.user.setPresence(payload);
+  const parts = [];
+  if (payload.status) parts.push(`status ${payload.status}`);
+  if ("activities" in payload) {
+    parts.push(activityLabel ? `activity "${activityLabel}"` : "activity cleared");
+  }
+  return `Presence set: ${parts.join(", ")}.`;
+}
+
 // ---------------------------------------------------------------- CLI: setup
 if (process.argv[2] === "setup") {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -369,7 +749,7 @@ if (process.argv[2] === "setup") {
   const userId = await ask("Your Discord user ID");
   const personality = await ask("Agent personality (tone)", config.personality || DEFAULT_PERSONALITY);
   rl.close();
-  saveConfig({ ...config, token, userId, personality });
+  saveConfig({ ...config, token, userId, personality, statusMessageId: userId === USER_ID ? config.statusMessageId : null });
   config = loadConfig();
   console.log(`Saved to ${CONFIG_PATH}`);
   try {
@@ -461,9 +841,172 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "send_embed",
+      description:
+        "Send a rich Discord embed for updates that need scanning. Pass title, description, fields ([{name, value, inline}]), color (#RRGGBB or red/green/blue/yellow/orange/purple/gold/grey/white/black), url and footer. Optional message adds plain text above the card. Discord caps: 25 fields, 6000 characters total; longer values are trimmed with a clear error.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          description: { type: "string" },
+          fields: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { name: { type: "string" }, value: { type: "string" }, inline: { type: "boolean" } },
+              required: ["name", "value"],
+            },
+          },
+          color: { type: "string", description: "Hex #RRGGBB or a named color" },
+          url: { type: "string" },
+          footer: { type: "string" },
+          message: { type: "string", description: "Optional plain text above the embed" },
+        },
+      },
+    },
+    {
+      name: "send_markdown",
+      description:
+        "Send long or richly structured content as a .md attachment. Discord renders .md files as a formatted document (GitHub-style headings, tables, lists, checklists, code blocks), so this beats the 2000-character message cap and keeps formatting. Use it for digests, plans, docs, changelogs, comparison tables. Pass markdown source, or path to an existing .md file; optional message is a short caption above it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          markdown: { type: "string", description: "Markdown source to send" },
+          path: { type: "string", description: "Path to an existing .md file instead of inline markdown" },
+          filename: { type: "string", description: 'Attachment name; ".md" is added if missing (default update.md)' },
+          message: { type: "string", description: "Optional caption above the attachment" },
+        },
+      },
+    },
+    {
+      name: "set_status",
+      description:
+        "Create or update ONE live status message in the DM instead of sending a new progress DM each time. The first call creates it, later calls edit it in place, and the id persists across restarts. Pass message text for a plain status, or title/fields/color/url/footer for a status card. If the message was deleted or wiped with clear_messages, the next call creates a fresh one. Emojis are applied only when the message is first created.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          message: { type: "string", description: "Status text (plain content, or embed description when card fields are present)" },
+          title: { type: "string" },
+          fields: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { name: { type: "string" }, value: { type: "string" }, inline: { type: "boolean" } },
+              required: ["name", "value"],
+            },
+          },
+          color: { type: "string", description: "Hex #RRGGBB or a named color" },
+          url: { type: "string" },
+          footer: { type: "string" },
+          emojis: { type: "array", items: { type: "string" }, description: "Optional reactions on creation" },
+        },
+      },
+    },
+    {
+      name: "clear_status",
+      description: "Delete the live status message created by set_status and forget its id. Safe to call when there is none.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "read_attachments",
+      description:
+        "Download a file the user sent back in the Discord DM and save it locally so the agent can open it. Pass message_id (printed by check_replies and ask_question) to target a message, or index (0 = newest user message) when you do not have an id. Use attachment to pick which file, or all:true to grab them all. Returns the saved path, size and type; text files are also previewed inline. Files over 50 MB are skipped.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          message_id: { type: "string", description: "Discord message id to read attachments from" },
+          index: { type: "number", description: "Which recent user message to use when no message_id is given (0 = newest)" },
+          attachment: { type: "number", description: "Which attachment on that message (0 = first)" },
+          all: { type: "boolean", description: "Download every attachment on the message" },
+          save_dir: { type: "string", description: "Where to save; defaults to a temp folder" },
+        },
+      },
+    },
+    {
+      name: "update_profile",
+      description:
+        "Give the bot its own identity. Change any of: name (the bot's username, 2-32 chars, 2 changes/hour max), bio (the About Me text on its Discord profile, up to 400 chars), avatar and banner (its profile art), icon and cover (its developer-profile art). Image fields take { path } for a local file or { data, filename } for base64, and must be png/jpg/gif/webp under 10 MB. Everything is optional; only what you pass changes. BIO IS DECORATION ONLY: a cool line, a vibe, taste in things. It is never a reply, a question, an announcement or a way to talk to the user; use send_message, progress_report or ask_question for anything they need to read.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "New bot username (2-32 chars: letters, numbers, _, .)" },
+          bio: {
+            type: "string",
+            description:
+              "Profile flavor only (max 400 chars): a cool line, vibe, taste, something aesthetic. Never a reply, question or message to the user. Empty clears it.",
+          },
+          avatar: {
+            type: "object",
+            description: "New avatar image",
+            properties: {
+              path: { type: "string", description: "Local image file (absolute or ~)" },
+              data: { type: "string", description: "Base64 bytes or a data URL, with filename" },
+              filename: { type: "string", description: "Name for data (extension decides the type)" },
+            },
+          },
+          banner: {
+            type: "object",
+            description: "New profile banner image",
+            properties: {
+              path: { type: "string" },
+              data: { type: "string" },
+              filename: { type: "string" },
+            },
+          },
+          icon: {
+            type: "object",
+            description: "Application icon (the art next to the app name)",
+            properties: {
+              path: { type: "string" },
+              data: { type: "string" },
+              filename: { type: "string" },
+            },
+          },
+          cover: {
+            type: "object",
+            description: "Application cover image (developer profile header)",
+            properties: {
+              path: { type: "string" },
+              data: { type: "string" },
+              filename: { type: "string" },
+            },
+          },
+        },
+      },
+    },
+    {
+      name: "set_presence",
+      description:
+        "Set the bot's live presence: status (online, idle, dnd, invisible) and/or the activity line under its name (activity + activity_type playing/watching/listening/streaming/competing/custom). Omitting a field keeps the current value; an empty activity clears it. PURELY AESTHETIC: use it for a mood, a cool fun fact, or a tiny hint of progress ('3/7 tests left'). Never use it to ask or answer the user or carry a message; use send_message, progress_report or set_status for anything they need to read. This is not the DM status message (that is set_status).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          status: {
+            type: "string",
+            enum: ["online", "idle", "dnd", "invisible"],
+            description: "Aesthetic status dot; not a communication channel",
+          },
+          activity: {
+            type: "string",
+            description:
+              "Decorative line only: a vibe, a cool fun fact, or a small progress hint. Not a place to talk to the user. Empty clears it.",
+          },
+          activity_type: {
+            type: "string",
+            enum: ["playing", "watching", "listening", "streaming", "competing", "custom"],
+            description: "How the activity reads; defaults to playing",
+          },
+          activity_url: {
+            type: "string",
+            description: "Twitch or YouTube link; required for streaming so Discord renders the Live style",
+          },
+        },
+      },
+    },
+    {
       name: "ask_question",
       description:
-        "Ask the user a question over Discord DM and wait for their reply, detected in real time via gateway events. Only counts replies that arrive AFTER the question, never an old message. If no reply arrives within timeout_ms (default 60000, max 600000), returns no reply plus default_answer so you can continue with your own judgment. Ask one question at a time in the same DM.",
+        "Ask the user a question over Discord DM and wait for their reply, detected in real time via gateway events. Only counts replies that arrive AFTER the question, never an old message. If no reply arrives within timeout_ms (default 60000, max 600000), returns no reply plus default_answer so you can continue with your own judgment. Ask one question at a time in the same DM. The reply includes a msg id you can pass to read_attachments when they answer with a file.",
       inputSchema: {
         type: "object",
         properties: {
@@ -481,7 +1024,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "check_replies",
       description:
-        "Non-blocking peek at the user's Discord DM replies. INCREMENTAL by default: returns only messages newer than your last check, so old answers never resurface; empty result means nothing new. Pass all:true to browse history instead, or since_minutes:N for a one-off wider window.",
+        "Non-blocking peek at the user's Discord DM replies. INCREMENTAL by default: returns only messages newer than your last check, so old answers never resurface; empty result means nothing new. Pass all:true to browse history instead, or since_minutes:N for a one-off wider window. Each line ends with [msg:id], which read_attachments accepts to download any file on that message.",
       inputSchema: {
         type: "object",
         properties: {
@@ -544,6 +1087,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return ok("Both token and user_id are required. Ask the user for the bot token and their Discord user ID.");
       }
       PERSONALITY = args.personality || PERSONALITY;
+      // A status message belongs to one user's DM: drop the old id if the user changed.
+      if (newUserId !== USER_ID) config = { ...config, statusMessageId: null };
       saveConfig({ ...config, token: newToken, userId: newUserId, personality: PERSONALITY });
       config = loadConfig();
       // Env vars win over the saved file until the process restarts.
@@ -596,6 +1141,27 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === "send_screenshot") {
       return ok(await sendAttachment(args));
     }
+    if (name === "send_embed") {
+      return ok(await sendEmbed(args));
+    }
+    if (name === "send_markdown") {
+      return ok(await sendMarkdown(args));
+    }
+    if (name === "set_status") {
+      return ok(await upsertStatus(args));
+    }
+    if (name === "clear_status") {
+      return ok(await clearStatus());
+    }
+    if (name === "read_attachments") {
+      return ok(await readAttachments(args));
+    }
+    if (name === "update_profile") {
+      return ok(await updateProfile(args));
+    }
+    if (name === "set_presence") {
+      return ok(await setPresence(args));
+    }
     if (name === "ask_question") {
       const timeoutMs = Math.min(Math.max(Number(args.timeout_ms) || 60000, 3000), 600000);
       const ch = await getChannel();
@@ -614,7 +1180,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const reply = await waitForReply(ch, cutoff, timeoutMs);
       if (reply) lastSeenTs = Math.max(lastSeenTs, reply.ts);
       const body = reply
-        ? `${reply.content || "(no text)"}${reply.attachments.length ? ` [attachment: ${reply.attachments.join(", ")}]` : ""} (from ${reply.from} at ${reply.at})`
+        ? `${reply.content || "(no text)"}${reply.attachments.length ? ` [attachment: ${reply.attachments.join(", ")}]` : ""} (from ${reply.from} at ${reply.at}, msg ${reply.id})`
         : `no reply within ${Math.round(timeoutMs / 1000)}s. Default answer used: ${args.default_answer ?? "(none given)"}`;
       return ok(`Answer: ${body}`);
     }
